@@ -3,6 +3,8 @@
  *********************************************************************/
 const express = require('express');
 const multer = require('multer');
+const { v4: uuidv4 } = require('uuid');
+const sanitize = require('sanitize-filename');
 const cookieParser = require('cookie-parser');
 const { OpenAI } = require('openai');
 
@@ -20,30 +22,33 @@ const {
     OPENAI_API_URL,
     OPENAI_EMBED_MODEL = 'text-embedding-ada-002',
     CHUNK_SIZE = 14000,
-    EMBED_DIM = 1024,
+    EMBED_DIM = 1536,
     OPENSEARCH_HOST = 'localhost',
     OPENSEARCH_PORT = 9200,
-    OPENSEARCH_INDEX_NAME = 'redmin_index',
+    OPENSEARCH_INDEX_NAME = 'redmine_index',
     MAX_FILE_SIZE = 10485760,
     MAX_FILES_PER_REQUEST = 5,
-    UPLOAD_DIR = './uploads',
+    TEMP_DIR,
+    UPLOAD_DIR,
 } = process.env;
+
+fs.ensureDirSync(UPLOAD_DIR);
 
 const app = express();
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY, baseURL: OPENAI_API_URL });
 const osClient = new OSClient({ node: `http://${OPENSEARCH_HOST}:${OPENSEARCH_PORT}` });
 const md = new MarkdownIt();
 
-fs.ensureDirSync(UPLOAD_DIR);
 
 /**************** Middleware ***************/
 app.use(express.json());
 app.use(cookieParser());
 
 const upload = multer({
-    dest: UPLOAD_DIR,
+    dest: TEMP_DIR,
     limits: { fileSize: Number(MAX_FILE_SIZE) },
 });
+
 
 /************ JWT Auth Middleware ***********/
 // async function authenticateJWT(req, res, next) {
@@ -174,13 +179,19 @@ app.post('/upload',
                     continue;
                 }
 
-                const text = await readFileText(file.path, ext.substring(1));
+                // Move file to permanent location
+                const sanitizedName = sanitize(path.basename(file.originalname));
+                const finalName = `${uuidv4()}_${sanitizedName}`;
+                const finalPath = path.join(UPLOAD_DIR, finalName);
+                await fs.move(file.path, finalPath); // Move file permanently
+
+                const text = await readFileText(finalPath, ext.substring(1));
                 const chunks = chunkText(text);
 
                 for (let i = 0; i < chunks.length; i++) {
                     const chunk = chunks[i];
                     const embedding = await embedText(chunk);
-                    const docId = `${file.filename}-${i}`;
+                    const docId = `${path.basename(finalName)}-${i}`;
 
                     docs.push({
                         index: { _index: OPENSEARCH_INDEX_NAME, _id: docId },
@@ -188,21 +199,35 @@ app.post('/upload',
                     docs.push({
                         doc_id: docId,
                         file_type: ext.substring(1),
-                        file_path: file.path,
+                        file_path: finalPath,
                         text_chunk: chunk,
                         embedding,
                     });
                 }
-
-                await fs.unlink(file.path); // clean up uploaded file
             }
 
             if (docs.length) {
-                await osClient.bulk({ refresh: true, body: docs });
+                // console.log('Bulk request body:', JSON.stringify(docs, null, 2));
+                const resp = await osClient.bulk({ refresh: true, body: docs });
+
+                // console.log('Bulk response:', JSON.stringify(resp, null, 2));
+                if (resp.body.errors) {
+                    for (const item of resp.body.items) {
+                        const action = Object.keys(item)[0];
+                        if (item[action].error) {
+                            console.error(`Failed to index document:`, JSON.stringify(item[action].error, null, 2));
+                        }
+                    }
+                    return res.status(500).json({ error: 'Bulk insert had errors', details: resp.body.items });
+                }
+
+                console.log(`Bulk inserted ${docs.length / 2} documents.`);
                 return res.json({ message: `Embedded and indexed ${docs.length / 2} documents.` });
             }
 
-            res.status(400).json({ error: 'No valid documents uploaded.' });
+            // If no docs at all
+            console.warn('No valid documents to insert.');
+            return res.status(400).json({ error: 'No valid documents uploaded.' });
         } catch (err) {
             console.error('Upload error:', err);
             res.status(500).json({ error: err.message });
